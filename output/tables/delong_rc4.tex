@@ -1,0 +1,88 @@
+\begin{table}
+
+\caption{\label{tab:delong_rc4}Logit vs. machine learning, DeLong test (RC4: excluding COVID years)}
+\centering
+\begin{threeparttable}
+\begin{tabular}[t]{lllrrrrr}
+\toprule
+Horizon & Specification & Model & AUC Logit & AUC ML & Difference & 95\% CI & p (Holm)\\
+\midrule
+ &  & RF & 0.288 & 0.573 & 0.285*** & {}[0.168, 0.402] & 0.000\\
+
+ &  & SVM & 0.288 & 0.365 & 0.077** & {}[0.015, 0.139] & 0.030\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.288 & 0.291 & 0.002 & {}[-0.069, 0.073] & 0.949\\
+
+ &  & RF & 0.329 & 0.413 & 0.084 & {}[-0.025, 0.194] & 0.261\\
+
+ &  & SVM & 0.329 & 0.730 & 0.401*** & {}[0.248, 0.554] & 0.000\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.329 & 0.349 & 0.020 & {}[-0.055, 0.095] & 0.600\\
+
+ &  & RF & 0.316 & 0.520 & 0.204*** & {}[0.094, 0.314] & 0.000\\
+
+ &  & SVM & 0.316 & 0.767 & 0.451*** & {}[0.330, 0.572] & 0.000\\
+
+\multirow[t]{-8}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 1} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Full} & MLP & 0.316 & 0.484 & 0.169*** & {}[0.101, 0.236] & 0.000\\
+\cmidrule{1-8}
+ &  & RF & 0.314 & 0.536 & 0.221*** & {}[0.148, 0.294] & 0.000\\
+
+ &  & SVM & 0.314 & 0.477 & 0.162*** & {}[0.063, 0.261] & 0.003\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.314 & 0.276 & -0.039** & {}[-0.072, -0.005] & 0.023\\
+
+ &  & RF & 0.327 & 0.382 & 0.055 & {}[-0.020, 0.130] & 0.302\\
+
+ &  & SVM & 0.327 & 0.330 & 0.003 & {}[-0.055, 0.061] & 0.923\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.327 & 0.277 & -0.050 & {}[-0.110, 0.009] & 0.297\\
+
+ &  & RF & 0.373 & 0.566 & 0.193*** & {}[0.115, 0.271] & 0.000\\
+
+ &  & SVM & 0.373 & 0.762 & 0.389*** & {}[0.298, 0.481] & 0.000\\
+
+\multirow[t]{-8}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 2} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Full} & MLP & 0.373 & 0.554 & 0.180*** & {}[0.121, 0.240] & 0.000\\
+\cmidrule{1-8}
+ &  & RF & 0.297 & 0.516 & 0.219*** & {}[0.153, 0.285] & 0.000\\
+
+ &  & SVM & 0.297 & 0.204 & -0.093*** & {}[-0.139, -0.046] & 0.000\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.297 & 0.316 & 0.020 & {}[-0.027, 0.066] & 0.403\\
+
+ &  & RF & 0.285 & 0.412 & 0.127*** & {}[0.066, 0.189] & 0.000\\
+
+ &  & SVM & 0.285 & 0.628 & 0.343*** & {}[0.265, 0.421] & 0.000\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.285 & 0.511 & 0.227*** & {}[0.155, 0.299] & 0.000\\
+
+ &  & RF & 0.524 & 0.561 & 0.037 & {}[-0.024, 0.097] & 0.466\\
+
+ &  & SVM & 0.524 & 0.622 & 0.098** & {}[0.025, 0.170] & 0.024\\
+
+\multirow[t]{-8}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 3} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Full} & MLP & 0.524 & 0.494 & -0.030 & {}[-0.095, 0.036] & 0.466\\
+\cmidrule{1-8}
+ &  & RF & 0.341 & 0.453 & 0.112*** & {}[0.062, 0.161] & 0.000\\
+
+ &  & SVM & 0.341 & 0.463 & 0.122*** & {}[0.068, 0.176] & 0.000\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.341 & 0.343 & 0.002 & {}[-0.026, 0.030] & 0.904\\
+
+ &  & RF & 0.326 & 0.400 & 0.074** & {}[0.017, 0.131] & 0.023\\
+
+ &  & SVM & 0.326 & 0.455 & 0.129*** & {}[0.049, 0.208] & 0.004\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.326 & 0.367 & 0.041** & {}[0.005, 0.077] & 0.028\\
+
+ &  & RF & 0.614 & 0.575 & -0.040 & {}[-0.088, 0.009] & 0.221\\
+
+ &  & SVM & 0.614 & 0.626 & 0.012 & {}[-0.041, 0.064] & 0.664\\
+
+\multirow[t]{-8}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 4} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Full} & MLP & 0.614 & 0.539 & -0.076* & {}[-0.139, -0.013] & 0.056\\
+\bottomrule
+\end{tabular}
+\begin{tablenotes}
+\item \textit{Notes: } 
+\item Difference = AUC(ML) - AUC(Logit). Paired DeLong test, two-sided, on pooled out-of-sample predictions; the CI is the difference $pm$ 1.96 DeLong standard errors. Holm adjustment within each horizon and specification (three comparisons). Stars refer to the Holm-adjusted p-value: * p<0.1, ** p<0.05, *** p<0.01.
+\end{tablenotes}
+\end{threeparttable}
+\end{table}

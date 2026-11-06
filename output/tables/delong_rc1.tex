@@ -1,0 +1,64 @@
+\begin{table}
+
+\caption{\label{tab:delong_rc1}Logit vs. machine learning, DeLong test (RC1: reduced sample)}
+\centering
+\begin{threeparttable}
+\begin{tabular}[t]{lllrrrrr}
+\toprule
+Horizon & Specification & Model & AUC Logit & AUC ML & Difference & 95\% CI & p (Holm)\\
+\midrule
+ &  & RF & 0.183 & 0.543 & 0.361*** & {}[0.283, 0.438] & 0.000\\
+
+ &  & SVM & 0.183 & 0.543 & 0.360*** & {}[0.234, 0.487] & 0.000\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.183 & 0.292 & 0.109** & {}[0.018, 0.199] & 0.019\\
+
+ &  & RF & 0.225 & 0.436 & 0.211*** & {}[0.104, 0.319] & 0.000\\
+
+ &  & SVM & 0.225 & 0.748 & 0.524*** & {}[0.409, 0.638] & 0.000\\
+
+\multirow[t]{-5}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 1} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.225 & 0.432 & 0.207*** & {}[0.153, 0.260] & 0.000\\
+\cmidrule{1-8}
+ &  & RF & 0.260 & 0.627 & 0.367*** & {}[0.293, 0.441] & 0.000\\
+
+ &  & SVM & 0.260 & 0.336 & 0.076 & {}[-0.016, 0.167] & 0.208\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.260 & 0.267 & 0.007 & {}[-0.034, 0.047] & 0.743\\
+
+ &  & RF & 0.284 & 0.420 & 0.136*** & {}[0.056, 0.216] & 0.001\\
+
+ &  & SVM & 0.284 & 0.556 & 0.272*** & {}[0.198, 0.346] & 0.000\\
+
+\multirow[t]{-5}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 2} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.284 & 0.506 & 0.223*** & {}[0.152, 0.294] & 0.000\\
+\cmidrule{1-8}
+ &  & RF & 0.288 & 0.530 & 0.241*** & {}[0.178, 0.305] & 0.000\\
+
+ &  & SVM & 0.288 & 0.283 & -0.006 & {}[-0.055, 0.043] & 0.821\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.288 & 0.344 & 0.055*** & {}[0.018, 0.093] & 0.008\\
+
+ &  & RF & 0.331 & 0.423 & 0.092*** & {}[0.034, 0.149] & 0.004\\
+
+ &  & SVM & 0.331 & 0.523 & 0.192*** & {}[0.133, 0.252] & 0.000\\
+
+\multirow[t]{-5}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 3} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.331 & 0.380 & 0.049** & {}[0.006, 0.093] & 0.026\\
+\cmidrule{1-8}
+ &  & RF & 0.295 & 0.491 & 0.195*** & {}[0.144, 0.247] & 0.000\\
+
+ &  & SVM & 0.295 & 0.244 & -0.051 & {}[-0.107, 0.006] & 0.159\\
+
+ & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Baseline} & MLP & 0.295 & 0.275 & -0.020 & {}[-0.061, 0.020] & 0.322\\
+
+ &  & RF & 0.359 & 0.426 & 0.067** & {}[0.006, 0.129] & 0.031\\
+
+ &  & SVM & 0.359 & 0.486 & 0.127*** & {}[0.046, 0.208] & 0.004\\
+
+\multirow[t]{-5}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 4} & \multirow[t]{-2}{*}[\normalbaselineskip]{\raggedright\arraybackslash Broad} & MLP & 0.359 & 0.530 & 0.171*** & {}[0.104, 0.238] & 0.000\\
+\bottomrule
+\end{tabular}
+\begin{tablenotes}
+\item \textit{Notes: } 
+\item Difference = AUC(ML) - AUC(Logit). Paired DeLong test, two-sided, on pooled out-of-sample predictions; the CI is the difference $pm$ 1.96 DeLong standard errors. Holm adjustment within each horizon and specification (three comparisons). Stars refer to the Holm-adjusted p-value: * p<0.1, ** p<0.05, *** p<0.01.
+\end{tablenotes}
+\end{threeparttable}
+\end{table}

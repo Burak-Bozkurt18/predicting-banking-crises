@@ -1,0 +1,18 @@
+\begin{table}
+
+\caption{\label{tab:pr_boot_rc3}Out-of-sample PR-AUC (RC3: region)}
+\centering
+\begin{tabular}[t]{llccccrrr}
+\toprule
+Horizon & Specification & Logit & RF & SVM & MLP & Prevalence & Pre-crisis obs. & Countries\\
+\midrule
+K = 1 & Full & 0.025 [0.014, 0.041] & 0.026 [0.017, 0.042] & 0.022 [0.014, 0.031] & 0.034 [0.022, 0.048] & 0.026 & 28 & 26\\
+\cmidrule{1-9}
+K = 2 & Full & 0.056 [0.032, 0.106] & 0.062 [0.040, 0.095] & 0.033 [0.022, 0.045] & 0.079 [0.046, 0.139] & 0.054 & 57 & 27\\
+\cmidrule{1-9}
+K = 3 & Full & 0.109 [0.060, 0.195] & 0.101 [0.061, 0.164] & 0.140 [0.091, 0.201] & 0.122 [0.077, 0.178] & 0.082 & 84 & 27\\
+\cmidrule{1-9}
+K = 4 & Full & 0.136 [0.072, 0.230] & 0.106 [0.069, 0.157] & 0.107 [0.069, 0.159] & 0.100 [0.062, 0.147] & 0.090 & 90 & 28\\
+\bottomrule
+\end{tabular}
+\end{table}

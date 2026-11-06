@@ -1,0 +1,18 @@
+\begin{table}
+
+\caption{\label{tab:roc_ci_rc2}Out-of-sample ROC-AUC (RC2: real growth vars)}
+\centering
+\begin{tabular}[t]{llcccc}
+\toprule
+Horizon & Specification & Logit & RF & SVM & MLP\\
+\midrule
+K = 1 & Full & 0.364 [0.233, 0.496] & 0.527 [0.428, 0.627] & 0.541 [0.472, 0.611] & 0.485 [0.357, 0.612]\\
+\cmidrule{1-6}
+K = 2 & Full & 0.412 [0.317, 0.507] & 0.560 [0.492, 0.629] & 0.658 [0.609, 0.706] & 0.511 [0.434, 0.589]\\
+\cmidrule{1-6}
+K = 3 & Full & 0.540 [0.459, 0.621] & 0.540 [0.477, 0.604] & 0.552 [0.475, 0.629] & 0.511 [0.427, 0.595]\\
+\cmidrule{1-6}
+K = 4 & Full & 0.629 [0.556, 0.702] & 0.574 [0.508, 0.640] & 0.331 [0.274, 0.388] & 0.442 [0.363, 0.522]\\
+\bottomrule
+\end{tabular}
+\end{table}

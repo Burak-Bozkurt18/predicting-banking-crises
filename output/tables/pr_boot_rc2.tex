@@ -1,0 +1,18 @@
+\begin{table}
+
+\caption{\label{tab:pr_boot_rc2}Out-of-sample PR-AUC (RC2: real growth vars)}
+\centering
+\begin{tabular}[t]{llccccrrr}
+\toprule
+Horizon & Specification & Logit & RF & SVM & MLP & Prevalence & Pre-crisis obs. & Countries\\
+\midrule
+K = 1 & Full & 0.024 [0.013, 0.042] & 0.027 [0.016, 0.043] & 0.029 [0.017, 0.100] & 0.034 [0.017, 0.089] & 0.026 & 28 & 26\\
+\cmidrule{1-9}
+K = 2 & Full & 0.057 [0.031, 0.102] & 0.058 [0.037, 0.087] & 0.072 [0.046, 0.110] & 0.059 [0.035, 0.101] & 0.054 & 57 & 27\\
+\cmidrule{1-9}
+K = 3 & Full & 0.146 [0.082, 0.274] & 0.088 [0.055, 0.140] & 0.131 [0.068, 0.235] & 0.123 [0.063, 0.207] & 0.082 & 84 & 27\\
+\cmidrule{1-9}
+K = 4 & Full & 0.227 [0.128, 0.363] & 0.114 [0.072, 0.171] & 0.065 [0.043, 0.099] & 0.141 [0.077, 0.231] & 0.090 & 90 & 28\\
+\bottomrule
+\end{tabular}
+\end{table}

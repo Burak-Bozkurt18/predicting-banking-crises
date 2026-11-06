@@ -1,0 +1,26 @@
+\begin{table}
+
+\caption{\label{tab:roc_ci_rc1}Out-of-sample ROC-AUC (RC1: reduced sample)}
+\centering
+\begin{tabular}[t]{llcccc}
+\toprule
+Horizon & Specification & Logit & RF & SVM & MLP\\
+\midrule
+ & Baseline & 0.183 [0.099, 0.267] & 0.543 [0.469, 0.618] & 0.543 [0.478, 0.608] & 0.292 [0.153, 0.430]\\
+
+\multirow[t]{-1}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 1} & Broad & 0.225 [0.129, 0.321] & 0.436 [0.321, 0.551] & 0.748 [0.700, 0.797] & 0.432 [0.333, 0.530]\\
+\cmidrule{1-6}
+ & Baseline & 0.260 [0.169, 0.350] & 0.627 [0.578, 0.676] & 0.336 [0.264, 0.407] & 0.267 [0.176, 0.357]\\
+
+\multirow[t]{-1}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 2} & Broad & 0.284 [0.193, 0.374] & 0.420 [0.324, 0.515] & 0.556 [0.485, 0.626] & 0.506 [0.426, 0.586]\\
+\cmidrule{1-6}
+ & Baseline & 0.288 [0.207, 0.370] & 0.530 [0.480, 0.579] & 0.283 [0.216, 0.349] & 0.344 [0.262, 0.425]\\
+
+\multirow[t]{-1}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 3} & Broad & 0.331 [0.255, 0.408] & 0.423 [0.345, 0.501] & 0.523 [0.461, 0.586] & 0.380 [0.301, 0.460]\\
+\cmidrule{1-6}
+ & Baseline & 0.295 [0.217, 0.373] & 0.491 [0.436, 0.545] & 0.244 [0.172, 0.317] & 0.275 [0.200, 0.350]\\
+
+\multirow[t]{-1}{*}[\normalbaselineskip]{\raggedright\arraybackslash K = 4} & Broad & 0.359 [0.286, 0.432] & 0.426 [0.347, 0.506] & 0.486 [0.444, 0.529] & 0.530 [0.462, 0.599]\\
+\bottomrule
+\end{tabular}
+\end{table}

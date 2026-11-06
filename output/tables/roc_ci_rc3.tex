@@ -1,0 +1,18 @@
+\begin{table}
+
+\caption{\label{tab:roc_ci_rc3}Out-of-sample ROC-AUC (RC3: region)}
+\centering
+\begin{tabular}[t]{llcccc}
+\toprule
+Horizon & Specification & Logit & RF & SVM & MLP\\
+\midrule
+K = 1 & Full & 0.393 [0.270, 0.517] & 0.505 [0.403, 0.607] & 0.465 [0.402, 0.529] & 0.642 [0.587, 0.696]\\
+\cmidrule{1-6}
+K = 2 & Full & 0.407 [0.318, 0.496] & 0.546 [0.467, 0.625] & 0.244 [0.195, 0.294] & 0.595 [0.518, 0.671]\\
+\cmidrule{1-6}
+K = 3 & Full & 0.443 [0.367, 0.518] & 0.549 [0.478, 0.621] & 0.743 [0.705, 0.781] & 0.665 [0.606, 0.724]\\
+\cmidrule{1-6}
+K = 4 & Full & 0.473 [0.400, 0.546] & 0.558 [0.491, 0.624] & 0.627 [0.583, 0.671] & 0.541 [0.476, 0.605]\\
+\bottomrule
+\end{tabular}
+\end{table}

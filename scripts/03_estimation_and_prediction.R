@@ -1,7 +1,20 @@
-# Step 3: Estimate logit models
-# Purpose:  
-# Inputs:   
-# Outputs:
+# =============================================================================
+# Early-warning models: estimation, forecasting, evaluation
+#
+# Design
+#   * ROC-AUC is the main metric (hyperparameter selection, DeLong comparison).
+#   * PR-AUC is reported as a supplementary metric with country-cluster
+#     bootstrap confidence intervals.
+#   * Hyperparameters are re-tuned every `retune_every` years using only
+#     information available at the retuning date.
+#   * Every analysis (main + robustness checks) is a "scenario" that runs
+#     through the SAME functions. Expensive steps (tuning, forecasting,
+#     bootstrap) are cached on disk. The cache key contains a hash of the
+#     data, the configuration AND the code of the model definition, so:
+#       - changing one model's workflow/grid recomputes only that model,
+#       - adding a robustness check does not recompute anything else,
+#       - rerunning an unchanged script is (almost) instant.
+# =============================================================================
 
 # 1 Load Packages =============================================================
 
@@ -12,50 +25,82 @@ library(kableExtra)
 library(pROC)
 library(foreach)
 library(doParallel)
-# library(kernelshap)
-# library(shapviz)
 library(themis)
-# library(treeshap)
 library(patchwork)
 
-# 2 Load Panel ===============================================================
+# 2 Configuration =============================================================
+
+last_known_crisis_year <- 2025
+first_year             <- 1970
+first_test_year        <- 2005
+retune_every           <- 5     # re-tune hyperparameters every 5 years
+n_assess               <- 10    # number of assessment years per tuning round
+n_boot                 <- 1000  # bootstrap replicates for PR-AUC intervals
+
+outcomes   <- paste0("precrisis", 1:4)
+models     <- c("Logit", "RF", "SVM", "MLP")
+ml_models  <- setdiff(models, "Logit")
+grid_size  <- c(RF = 30, SVM = 30, MLP = 15)
+
+horizon_of    <- function(outcome) as.integer(sub("precrisis", "", outcome))
+max_test_year <- function(outcome) last_known_crisis_year - horizon_of(outcome)
+k_label       <- function(outcome) paste0("K = ", horizon_of(outcome))
+
+# Retuning dates: 2005, 2010, 2015, 2020
+retune_years   <- seq(first_test_year, last_known_crisis_year - 1, by = retune_every)
+retune_year_of <- function(y) max(retune_years[retune_years <= y])
+
+cache_dir <- "cache"
+table_dir <- "output/tables"
+fig_dir   <- "output/figures"
+walk(c(cache_dir, table_dir, fig_dir), dir.create, showWarnings = FALSE)
+
+# 3 Helpers ===================================================================
+
+# Evaluate `expr` only if `file` does not exist; otherwise read it from disk
+cached <- function(file, expr) {
+  if (file.exists(file)) {
+    message("cache hit: ", basename(file))
+    return(read_rds(file))
+  }
+  res <- expr
+  write_rds(res, file, compress = "gz")
+  res
+}
+
+cache_file <- function(type, model, outcome, spec, key) {
+  file.path(cache_dir,
+            sprintf("%s_%s_%s_%s_%s.rds", type, model, outcome, spec,
+                    substr(key, 1, 10)))
+}
+
+write_table <- function(x, name) {
+  writeLines(as.character(x), file.path(table_dir, paste0(name, ".tex")))
+  invisible(x)
+}
+
+stars <- function(p) {
+  case_when(is.na(p) ~ "", p < 0.01 ~ "***", p < 0.05 ~ "**", p < 0.1 ~ "*",
+            TRUE ~ "")
+}
+
+# 4 Data and scenarios ========================================================
 
 panel <- read_rds("data/final/panel.rds")
 
-# 3 Set Theme ================================================================
-
-theme_set(
-  theme_minimal() +
-    theme(
-      text = element_text(family = "serif", size = 12),
-      axis.text = element_text(size = 12, colour = "black"),
-      axis.line = element_line(linewidth = 0.5),
-      axis.ticks = element_line(linewidth = 0.5),
-      panel.grid = element_line(linetype = "dashed")
-    )
-)
-
-par(family = "serif")
-
-
-
-# 4. Preprocessing ============================================================
-
-# Logit Panel
-
-panel_logit <- panel |> 
-  filter(crisis != 1) |> 
+# One cleaned panel for everything (logit and ML see identical data)
+panel_base <- panel |>
+  filter(crisis != 1) |>
   mutate(
     advanced = factor(advanced),
-    precrisis1 = factor(precrisis1),
-    precrisis2 = factor(precrisis2),
-    precrisis3 = factor(precrisis3),
-    precrisis4 = factor(precrisis4)
-    )
+    region   = factor(region),
+    across(all_of(outcomes), factor)
+  )
 
+stopifnot(identical(levels(panel_base$precrisis1), c("0", "1")))
 
+panel_logit <- panel_base   # used for the in-sample logits below
 
-# Define model specifications
 specs <- list(
   baseline = c("advanced", "cgdppriv_growth"),
   broad    = c("advanced", "cgdppriv_growth", "govcgdp_growth",
@@ -65,80 +110,97 @@ specs <- list(
                "bmgdpgrowth", "bmtr", "sprr")
 )
 
-outcomes <- c("precrisis1", "precrisis2", "precrisis3", "precrisis4")
+full_vars_rc2 <- c("advanced", "tlpriv_rgrowth", "govcgdp_growth",
+                   "rgdpgrowth", "inflation", "ltd", "bcagdp",
+                   "bm_rgrowth", "bmtr", "sprr")
 
-# Horizon / embargo helpers
-last_known_crisis_year <- 2025
-horizon_of <- function(outcome) as.integer(sub("precrisis", "", outcome))
-max_test_year <- function(outcome) last_known_crisis_year - horizon_of(outcome)
+full_vars_rc3 <- c("region", "cgdppriv_growth", "govcgdp_growth",
+                   "rgdpgrowth", "inflation", "ltd", "bcagdp",
+                   "bmgdpgrowth", "bmtr", "sprr")
 
-first_test_year <- 2005
-first_year      <- 1970
+# A scenario = a set of specifications (+ optional sample restriction).
+# Adding a robustness check means adding one entry here.
+scenarios <- list(
+  main = list(specs = specs, complete_on = NULL),
+  # RC1: baseline and broad on the same sample as the full specification
+  rc1  = list(specs = specs[c("baseline", "broad")], complete_on = specs$full),
+  # RC2: real growth variables
+  rc2  = list(specs = list(full = full_vars_rc2), complete_on = NULL),
+  # RC3: region instead of advanced
+  rc3  = list(specs = list(full = full_vars_rc3), complete_on = NULL)
+)
+# RC4 (excluding COVID years) needs no new estimation: it re-evaluates the
+# main predictions up to 2019 (see section 11).
 
-# Format a vector of years as "1970--2003" (en dash in LaTeX), "2004" or "--"
+# Estimation data for one scenario x outcome x specification.
+# Output columns: iso3c, year, truth (factor "0"/"1"), predictors
+get_panel <- function(scn, outcome, spec) {
+  vars <- scn$specs[[spec]]
+  panel_base |>
+    select(iso3c, year, all_of(outcome),
+           all_of(unique(c(vars, scn$complete_on)))) |>
+    drop_na() |>
+    select(iso3c, year, all_of(outcome), all_of(vars)) |>
+    rename(truth = all_of(outcome))
+}
+
+# 5 Theme =====================================================================
+
+theme_set(
+  theme_minimal() +
+    theme(
+      text = element_text(family = "serif", size = 12),
+      axis.text = element_text(size = 9, colour = "black"),
+      axis.line = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5),
+      panel.grid = element_line(linetype = "dashed")
+    )
+)
+
+# 6 Sample composition table ==================================================
+
 fmt_range <- function(x) {
   if (length(x) == 0) return("--")
   r <- range(x)
   if (r[1] == r[2]) as.character(r[1]) else paste0(r[1], "--", r[2])
 }
 
-create_sample_summary <- function(data, variables, outcome) {
-  
+create_sample_summary <- function(outcome, spec) {
   h         <- horizon_of(outcome)
-  train_end <- first_test_year - 1 - h      # last training year for the first forecast
+  train_end <- first_test_year - 1 - h
   test_end  <- max_test_year(outcome)
   
-  sample <- data |>
-    select(iso3c, year, advanced, all_of(outcome), all_of(variables)) |>
-    drop_na() |>
-    mutate(y = .data[[outcome]] == 1)
+  s <- get_panel(scenarios$main, outcome, spec) |>
+    mutate(y = truth == "1")
   
-  train    <- sample |> filter(year >= first_year, year <= train_end)
-  embargo  <- sample |> filter(year > train_end, year < first_test_year)
-  test     <- sample |> filter(year >= first_test_year, year <= test_end)
+  train   <- filter(s, year >= first_year, year <= train_end)
+  gap <- filter(s, year > train_end, year < first_test_year)
+  test    <- filter(s, year >= first_test_year, year <= test_end)
   
-  # Sanity check: the three groups should cover the full sample
-  if (nrow(train) + nrow(embargo) + nrow(test) != nrow(sample)) {
-    warning("Train + embargo + test != full sample for ", outcome)
+  if (nrow(train) + nrow(gap) + nrow(test) != nrow(s)) {
+    warning("Train + gap + test != full sample for ", outcome)
   }
   
   tibble(
-    observations   = nrow(sample),
-    precrisisK     = sum(sample$y),
-    countries      = n_distinct(sample$iso3c),
-    advanced_share = (mean(as.integer(sample$advanced)) - 1) * 100,
+    observations   = nrow(s),
+    precrisisK     = sum(s$y),
+    countries      = n_distinct(s$iso3c),
+    advanced_share = (mean(as.integer(s$advanced)) - 1) * 100,
     train_years    = fmt_range(train$year),
     training_obs   = nrow(train),
     training_share = mean(train$y) * 100,
-    embargo_obs    = nrow(embargo),
+    gap_obs    = nrow(gap),
     test_years     = fmt_range(test$year),
     testing_obs    = nrow(test),
     testing_share  = mean(test$y) * 100
   )
 }
 
-summary_table <- map_dfr(
-  names(specs),
-  \(spec) {
-    map_dfr(
-      outcomes,
-      \(outcome) {
-        create_sample_summary(
-          data      = panel_logit,
-          variables = specs[[spec]],
-          outcome   = outcome
-        ) |>
-          mutate(specification = spec, outcome = outcome, .before = 1)
-      }
-    )
-  }
-)
-
-tab_df <- summary_table |>
-  mutate(
-    specification = factor(specification, levels = names(specs)),
-    Outcome = str_replace(outcome, "precrisis", "K = ")
-  ) |>
+tab_df <- expand_grid(specification = names(specs), outcome = outcomes) |>
+  mutate(summary = map2(outcome, specification, create_sample_summary),
+         specification = factor(specification, levels = names(specs)),
+         Outcome = k_label(outcome)) |>
+  unnest(summary) |>
   arrange(specification, outcome)
 
 panel_index <- tab_df |>
@@ -146,253 +208,77 @@ panel_index <- tab_df |>
   mutate(label = str_to_title(as.character(specification))) %>%
   { setNames(.$n, .$label) }
 
-tab_fmt <- tab_df |>
+tab_sample <- tab_df |>
   transmute(
     Outcome,
-    obs        = prettyNum(observations, big.mark = ","),
-    pre_obs    = prettyNum(precrisisK,   big.mark = ","),
-    countries  = as.character(countries),
-    advanced   = formatC(advanced_share, format = "f", digits = 1),
-    train_yrs  = train_years,
-    train_obs  = prettyNum(training_obs, big.mark = ","),
-    train_pre  = formatC(training_share, format = "f", digits = 1),
-    emb_obs    = prettyNum(embargo_obs,  big.mark = ","),
-    test_yrs   = test_years,
-    test_obs   = prettyNum(testing_obs,  big.mark = ","),
-    test_pre   = formatC(testing_share,  format = "f", digits = 1)
-  )
-
-tab_fmt |>
+    obs       = prettyNum(observations, big.mark = ","),
+    pre_obs   = prettyNum(precrisisK, big.mark = ","),
+    countries = as.character(countries),
+    advanced  = formatC(advanced_share, format = "f", digits = 1),
+    train_yrs = train_years,
+    train_obs = prettyNum(training_obs, big.mark = ","),
+    train_pre = formatC(training_share, format = "f", digits = 1),
+    gap_obs   = prettyNum(gap_obs, big.mark = ","),
+    test_yrs  = test_years,
+    test_obs  = prettyNum(testing_obs, big.mark = ","),
+    test_pre  = formatC(testing_share, format = "f", digits = 1)
+  ) |>
   kbl(
-    format    = "latex",
-    booktabs  = TRUE,
-    align     = paste0("l", strrep("r", 11)),
-    escape    = FALSE,
-    linesep   = "",
-    col.names = c("Outcome",
-                  "Obs.", "PreCrisis obs.", "Countries", "Advanced (\\%)",
-                  "Years", "Obs.", "PreCrisis (\\%)",
-                  "Obs.",
-                  "Years", "Obs.", "PreCrisis (\\%)"),
-    caption   = "Sample composition by model specification and crisis horizon",
-    label     = "sample_summary"
+    format = "latex", booktabs = TRUE, align = paste0("l", strrep("r", 11)),
+    escape = FALSE, linesep = "",
+    col.names = c("Outcome", "Obs.", "PreCrisis obs.", "Countries",
+                  "Advanced (\\%)", "Years", "Obs.", "PreCrisis (\\%)",
+                  "Obs.", "Years", "Obs.", "PreCrisis (\\%)"),
+    caption = "Sample composition by model specification and crisis horizon",
+    label = "sample_summary"
   ) |>
   pack_rows(index = panel_index, bold = TRUE, italic = FALSE,
             latex_gap_space = "0.4em") |>
   add_header_above(c(" " = 1, "Full sample" = 4, "Training" = 3,
-                     "Embargo" = 1, "Testing" = 3)) |>
+                     "Gap" = 1, "Testing" = 3)) |>
   kable_styling(latex_options = c("hold_position", "scale_down"),
                 position = "center")
 
+tab_sample
 
-# 5 Estimate Logit Models =====================================================
+# 7 In-sample logits (full sample, descriptive) ===============================
 
-## 5.1 In-Sample ==============================================================
-
-# Custom model summary
 gof_custom <- function(model) {
-  
-  # Model data
-  mf <- model.frame(model)
-  
-  # Identify observations used by the model
-  rows <- as.integer(rownames(mf))
-  
-  # Countries in estimation sample
-  countries <- unique(panel_logit$iso3c[rows])
-  
-  # Number of countries
-  n_countries <- length(countries)
-  
-  # Predicted probabilities
-  p <- predict(model, type = "response")
-  
-  # Actual outcome
-  y <- model.response(mf)
-  
-  # McFadden R²
-  ll_model <- as.numeric(logLik(model))
-  
-  null_model <- glm(y ~ 1, family = binomial())
-  
-  ll_null <- as.numeric(logLik(null_model))
-  
-  mcfadden_r2 <- 1 - ll_model / ll_null
-  
-  data.frame(
-    `Num. Countries` = n_countries,
-    `McFadden R²` = round(mcfadden_r2, 3)
-  )
+  mf        <- model.frame(model)
+  rows      <- as.integer(rownames(mf))
+  n_countries <- length(unique(panel_logit$iso3c[rows]))
+  y         <- model.response(mf)
+  ll_model  <- as.numeric(logLik(model))
+  ll_null   <- as.numeric(logLik(glm(y ~ 1, family = binomial())))
+  data.frame(`Num. Countries` = n_countries,
+             `McFadden R²` = round(1 - ll_model / ll_null, 3))
 }
 
-estimate_logit <- function(data, outcome) {
-  map(specs, \(rhs) glm(reformulate(rhs, response = outcome),
-                           data = data, family = binomial()))
-}
+models_insample <- map(
+  outcomes,
+  \(o) map(specs, \(rhs) glm(reformulate(rhs, response = o),
+                             data = panel_logit, family = binomial()))
+) |> setNames(outcomes)
 
-models_all <- setNames(
-  map(
-    outcomes,
-    \(outcome) estimate_logit(panel_logit, outcome)
-  ),
-  outcomes
+walk2(
+  list(c("precrisis1", "precrisis2"), c("precrisis3", "precrisis4")),
+  c("Early-warning logits, 1-2 year horizons",
+    "Early-warning logits, 3-4 year horizons"),
+  \(os, ttl) {
+    modelsummary(
+      models_insample[os], title = ttl, gof_function = gof_custom,
+      gof_omit = "RMSE|Log.Lik.|Std.Errors|AIC", coef_omit = "(Intercept)",
+      stars = TRUE, vcov = ~iso3c, shape = "cbind", output = "latex"
+    ) |> print()
+  }
 )
 
-# Summarize results
-modelsummary(
-  models_all[c("precrisis1", "precrisis2")],
-  title = "Early-warning logits, 1-2 year horizons",
-  gof_function = gof_custom,
-  gof_omit = "RMSE|Log.Lik.|Std.Errors|AIC",
-  coef_omit = "(Intercept)",
-  stars = TRUE,
-  vcov = ~iso3c,
-  shape = "cbind",
-  output = "latex"
-)
+# 8 Model definitions =========================================================
+# Everything that defines a model's architecture lives here. Editing one of
+# these functions invalidates the cache of that model only.
 
-modelsummary(
-  models_all[c("precrisis3", "precrisis4")],
-  title = "Early-warning logits, 3-4 year horizons",
-  gof_function = gof_custom,
-  gof_omit = "RMSE|Log.Lik.|Std.Errors|AIC",
-  coef_omit = "(Intercept)",
-  stars = TRUE,
-  vcov = ~iso3c,
-  shape = "cbind",
-  output = "latex"
-)
-
-## 5.2 Out-of-sample ==========================================================
-
-forecast_logit <- function(formula, data, forecast_years, horizon) {
-  
-  predictions <- map(forecast_years, function(test_year) {
-    
-    # Expanding training window
-    train <- data |>
-      filter(year < test_year - horizon)
-    
-    # One-year test set
-    test <- data |>
-      filter(year == test_year)
-    
-    # Estimate model
-    model <- glm(formula = formula, data = train, family = binomial())
-    
-    # Predict test year
-    test |>
-      mutate(.pred_1 = predict(model, newdata = test, type = "response"))
-    
-  })
-  
-  bind_rows(predictions)
-}
-
-logit_oos_results <- expand_grid(
-  outcome       = outcomes,
-  specification = names(specs)
-) |>
-  mutate(
-    preds = map2(outcome, specification, \(o, s) {
-      forecast_logit(
-        formula        = reformulate(specs[[s]], response = o),
-        data           = panel_logit,
-        forecast_years = 2005:max_test_year(o),
-        horizon = horizon_of(o)
-      )
-    })
-  )
-
-evaluate <- function(results, outcome) {
-  
-  results <- results |>
-    filter(!is.na(.data[[outcome]]), !is.na(.pred_1))
-  
-  bind_rows(
-    roc_auc(results, truth = !!sym(outcome), .pred_1, event_level = "second"),
-    pr_auc( results, truth = !!sym(outcome), .pred_1, event_level = "second")
-  )
-}
-
-logit_auc <- logit_oos_results |>
-  mutate(metrics = map2(preds, outcome, evaluate)) |>
-  select(outcome, specification, metrics) |>
-  unnest(metrics)
-
-# 4. Cross-validation =========================================================
-
-# Outcome / horizon bookkeeping ------------------------------------------
-
-outcomes <- c("precrisis1", "precrisis2", "precrisis3", "precrisis4")
-
-horizon_of <- function(outcome) as.integer(sub("precrisis", "", outcome))
-
-last_known_crisis_year <- 2025
-max_test_year <- function(outcome) last_known_crisis_year - horizon_of(outcome)
-
-# ML panels, now nested outcome -> spec -----------------------------------
-
-panel_temp <- panel |>
-  filter(crisis != 1) |>
-  mutate(across(all_of(outcomes), factor))
-
-make_panels_ml <- function(outcome) {
-  map(specs, \(vars) panel_temp |>
-        select(year, iso3c, all_of(outcome), all_of(vars)) |>
-        drop_na())
-}
-
-panels_ml_all <- map(outcomes, make_panels_ml) |> setNames(outcomes)
-
-train_all <- map(
-  panels_ml_all,
-  \(spec_list) map(spec_list, \(data) filter(data, year <= 2004))
-)
-
-# CV periods, now a function of horizon -----------------------------------
-
-make_cv_periods <- function(horizon) {
-  tibble(
-    id = paste0("Fold", 1:10),
-    analysis_start = 1970,
-    assessment_start = 1995:2004,
-    assessment_end = 1995:2004,
-    analysis_end = assessment_start - 1 - horizon
-  )
-}
-
-make_split <- function(data, analysis_start, analysis_end, assessment_start, assessment_end) {
-  make_splits(
-    x = list(
-      analysis = which(data$year >= analysis_start & data$year <= analysis_end),
-      assessment = which(data$year >= assessment_start & data$year <= assessment_end)
-    ),
-    data = data
-  )
-}
-
-make_folds <- function(data, cv_periods) {
-  manual_rset(
-    splits = pmap(
-      cv_periods[, c("analysis_start", "analysis_end", "assessment_start", "assessment_end")],
-      \(analysis_start, analysis_end, assessment_start, assessment_end) {
-        make_split(data, analysis_start, analysis_end, assessment_start, assessment_end)
-      }
-    ),
-    ids = cv_periods$id
-  )
-}
-
-folds_all <- map(outcomes, \(o) {
-  cvp <- make_cv_periods(horizon_of(o))
-  map(train_all[[o]], \(d) make_folds(d, cvp))
-}) |> setNames(outcomes)
-
-# Random forest workflow / grid, now parameterized by outcome -------------
-
-make_rf_workflow <- function(data, outcome) {
-  recipe(reformulate(".", response = outcome), data = data) |>
+make_rf_workflow <- function(data) {
+  recipe(truth ~ ., data = data) |>
     step_rm(iso3c, year) |>
     workflow() |>
     add_model(
@@ -402,8 +288,8 @@ make_rf_workflow <- function(data, outcome) {
     )
 }
 
-make_rf_grid <- function(data, outcome, size = 30) {
-  n_predictors <- data |> select(-all_of(outcome), -iso3c, -year) |> ncol()
+make_rf_grid <- function(data, size) {
+  n_predictors <- ncol(data) - 3   # minus truth, iso3c, year
   grid_random(
     mtry(range = c(2L, n_predictors)),
     min_n(range = c(2L, 30L)),
@@ -411,1037 +297,548 @@ make_rf_grid <- function(data, outcome, size = 30) {
   )
 }
 
-tune_model <- function(data, folds, outcome, model_type = c("rf", "svm", "mlp"), grid_size = 30) {
-  model_type <- match.arg(model_type)
-  workflow_fn <- match.fun(paste0("make_", model_type, "_workflow"))
-  grid_fn     <- match.fun(paste0("make_", model_type, "_grid"))
-  
-  workflow <- workflow_fn(data, outcome)
-  grid     <- grid_fn(data, outcome, grid_size)
-  
-  tune_grid(
-    workflow,
-    resamples = folds,
-    grid = grid,
-    metrics = metric_set(pr_auc),
-    control = control_grid(save_pred = TRUE, verbose = TRUE)
-  )
-}
-
-set.seed(123)
-n_cores <- detectCores() - 1
-cl <- makePSOCKcluster(n_cores)
-registerDoParallel(cl)
-
-rf_tuned_all <- map(outcomes, \(o) {
-  map2(train_all[[o]], folds_all[[o]], \(d, f) tune_model(d, f, outcome = o, model_type = "rf"))
-}) |> setNames(outcomes)
-
-best_rf_all <- map(
-  rf_tuned_all,
-  \(spec_list) map(spec_list, \(x) select_best(x, metric = "pr_auc"))
-)
-
-# Pseudo-OOS forecasting, now taking outcome + horizon ---------------------
-
-forecast_model <- function(data, best_params, forecast_years, horizon, outcome,
-                           model_type = c("rf", "svm", "mlp")) {
-  model_type <- match.arg(model_type)
-  workflow_fn <- match.fun(paste0("make_", model_type, "_workflow"))
-  
-  final_workflow <- workflow_fn(data, outcome) |>
-    finalize_workflow(best_params)
-  
-  map(
-    forecast_years,
-    function(y) {
-      message("Forecasting ", outcome, ", year: ", y)
-      
-      train_data <- data |> filter(year >= 1970, year <= y - 1 - horizon)
-      test_data  <- data |> filter(year == y)
-      
-      fit <- final_workflow |> fit(data = train_data)
-      predictions <- predict(fit, new_data = test_data, type = "prob")
-      
-      test_data |>
-        select(iso3c, year, all_of(outcome)) |>
-        bind_cols(predictions)
-    }
-  ) |>
-    list_rbind()
-}
-
-set.seed(123)
-
-rf_oos_results_all <- map(outcomes, \(o) {
-  map2(
-    panels_ml_all[[o]], best_rf_all[[o]],
-    \(data, params) forecast_model(
-      data, params,
-      forecast_years = 2005:max_test_year(o),
-      horizon = horizon_of(o),
-      outcome = o,
-      model_type = "rf"
-    )
-  )
-}) |> setNames(outcomes)
-
-# Evaluation, now outcome-aware --------------------------------------------
-
-evaluate <- function(results, outcome) {
-  results <- results |> filter(!is.na(.data[[outcome]]), !is.na(.pred_1))
-  bind_rows(
-    roc_auc(results, truth = !!sym(outcome), .pred_1, event_level = "second"),
-    pr_auc( results, truth = !!sym(outcome), .pred_1, event_level = "second")
-  )
-}
-
-rf_auc <- map(outcomes, \(o) {
-  map(rf_oos_results_all[[o]], \(res) evaluate(res, o)) |>
-    list_rbind(names_to = "specification")
-}) |>
-  setNames(outcomes) |>
-  list_rbind(names_to = "outcome")
-
-
-# 5. Support Vector Machines ==================================================
-
-# Generic SVM workflow, now outcome-aware
-make_svm_workflow <- function(data, outcome) {
-  
-  recipe(reformulate(".", response = outcome), data = data) |>
+make_svm_workflow <- function(data) {
+  recipe(truth ~ ., data = data) |>
     step_rm(iso3c, year) |>
     step_dummy(all_nominal_predictors()) |>
     step_normalize(all_predictors()) |>
-    step_upsample(
-      all_of(outcome),
-      over_ratio = 0.5
-    ) |>
+    step_upsample(truth, over_ratio = 0.5) |>
     workflow() |>
     add_model(
-      svm_rbf(
-        cost = tune(),
-        rbf_sigma = tune()
-      ) |>
+      svm_rbf(cost = tune(), rbf_sigma = tune()) |>
         set_engine("kernlab") |>
         set_mode("classification")
     )
 }
 
-
-# Hyperparameter grid (data/outcome args unused here, but kept for
-# interface consistency with make_rf_grid via match.fun() dispatch)
-make_svm_grid <- function(data, outcome, size = 30) {
-  
-  grid_space_filling(
-    cost(),
-    rbf_sigma(),
-    size = size
-  )
+make_svm_grid <- function(data, size) {
+  grid_space_filling(cost(), rbf_sigma(), size = size)
 }
 
-
-# Tune all specifications, for every outcome ==================================
-
-set.seed(123)
-
-svm_tuned_all <- map(outcomes, \(o) {
-  map2(train_all[[o]], folds_all[[o]], \(d, f) tune_model(d, f, outcome = o, model_type = "svm"))
-}) |> setNames(outcomes)
-
-
-# Best hyperparameters =========================================================
-
-best_svm_all <- map(
-  svm_tuned_all,
-  \(spec_list) map(spec_list, \(x) select_best(x, metric = "pr_auc"))
-)
-
-best_svm_all
-
-
-# Forecast all outcomes x specifications, embargoed ============================
-
-set.seed(222)
-
-svm_oos_results_all <- map(outcomes, \(o) {
-  map2(
-    panels_ml_all[[o]], best_svm_all[[o]],
-    \(data, params) forecast_model(
-      data, params,
-      forecast_years = 2005:max_test_year(o),
-      horizon = horizon_of(o),
-      outcome = o,
-      model_type = "svm"
-    )
-  )
-}) |> setNames(outcomes)
-
-
-# Evaluation ====================================================================
-
-svm_auc <- map(outcomes, \(o) {
-  map(svm_oos_results_all[[o]], \(res) evaluate(res, o)) |>
-    list_rbind(names_to = "specification")
-}) |>
-  setNames(outcomes) |>
-  list_rbind(names_to = "outcome")
-
-
-# 6. Multilayer Perceptrons ===================================================
-
-# +++ All Precrisis variables +++ =============================================
-
-# 6. Multilayer Perceptrons ===================================================
-
-make_mlp_workflow <- function(data, outcome) {
-  
-  recipe(reformulate(".", response = outcome), data = data) |>
+make_mlp_workflow <- function(data) {
+  recipe(truth ~ ., data = data) |>
     step_rm(iso3c, year) |>
     step_dummy(all_nominal_predictors()) |>
     step_normalize(all_predictors()) |>
-    step_upsample(
-      all_of(outcome),
-      over_ratio = 0.5
-    ) |>
+    step_upsample(truth, over_ratio = 0.5) |>
     workflow() |>
     add_model(
-      mlp(
-        hidden_units = tune(),
-        penalty = tune(),
-        epochs = 50,
-        activation = "relu"
-      ) |>
+      mlp(hidden_units = tune(), penalty = tune(),
+          epochs = 50, activation = "relu") |>
         set_engine("brulee", stop_iter = 5) |>
         set_mode("classification")
     )
 }
 
-make_mlp_grid <- function(data, outcome, size = 15) {
-  
-  grid_space_filling(
-    hidden_units(),
-    penalty(),
-    size = size
-  )
+make_mlp_grid <- function(data, size) {
+  grid_space_filling(hidden_units(), penalty(), size = size)
 }
 
-# Tune all MLP specifications, for every outcome ==============================
+workflow_fns <- list(RF = make_rf_workflow,  SVM = make_svm_workflow,
+                     MLP = make_mlp_workflow)
+grid_fns     <- list(RF = make_rf_grid,      SVM = make_svm_grid,
+                     MLP = make_mlp_grid)
 
-set.seed(123)
+# 9 Pipeline functions ========================================================
 
-mlp_tuned_all <- map(outcomes, \(o) {
-  map2(train_all[[o]], folds_all[[o]], \(d, f) tune_model(d, f, outcome = o, model_type = "mlp", grid_size = 15))
-}) |> setNames(outcomes)
+## 9.1 Tuning (ROC-AUC, rolling re-tuning) ====================================
 
-# Select best hyperparameters ==================================================
-
-best_mlp_all <- map(
-  mlp_tuned_all,
-  \(spec_list) map(spec_list, \(x) select_best(x, metric = "pr_auc"))
-)
-
-best_mlp_all
-
-# Out-of-sample predictions, embargoed and per outcome =========================
-
-set.seed(123)
-
-mlp_oos_results_all <- map(outcomes, \(o) {
-  map2(
-    panels_ml_all[[o]], best_mlp_all[[o]],
-    \(data, params) forecast_model(
-      data, params,
-      forecast_years = 2005:max_test_year(o),
-      horizon = horizon_of(o),
-      outcome = o,
-      model_type = "mlp"
-    )
-  )
-}) |> setNames(outcomes)
-
-# Evaluation ====================================================================
-
-mlp_auc <- map(outcomes, \(o) {
-  map(mlp_oos_results_all[[o]], \(res) evaluate(res, o)) |>
-    list_rbind(names_to = "specification")
-}) |>
-  setNames(outcomes) |>
-  list_rbind(names_to = "outcome")
-
-# Evaluate all ML results ===================================================
-model_auc <- bind_rows(
-  
-  logit_auc |> 
-    mutate(model = "Logit"),
-  
-  rf_auc |>
-    mutate(model = "RF"),
-  
-  svm_auc |>
-    mutate(model = "SVM"),
-  
-  mlp_auc |>
-    mutate(model = "MLP")
-  
+# Folds for a retuning at the beginning of `retune_year`.
+# Labels of year t become known in t + horizon, so assessment years end at
+# retune_year - 1 - horizon, and the analysis window of each fold ends
+# `horizon` + 1 years before its assessment year (gap).
+make_cv_periods <- function(horizon, retune_year) {
+  assess_end <- retune_year - 1 - horizon
+  tibble(
+    id              = paste0("Fold", seq_len(n_assess)),
+    analysis_start  = first_year,
+    assessment_year = (assess_end - n_assess + 1):assess_end
   ) |>
-  select(
-    outcome,
-    specification,
-    model,
-    .metric,
-    .estimate
-  ) |> 
-  pivot_wider(
-    names_from = "model",
-    values_from = ".estimate"
-  ) |> 
-  arrange(.metric)
+    mutate(analysis_end = assessment_year - 1 - horizon)
+}
 
-model_auc |>
-  pivot_wider(
-    names_from  = .metric,
-    values_from = c(Logit, RF, SVM, MLP),
-    names_glue  = "{.metric}_{.value}"
-  ) |>
-  select(outcome, specification,
-         starts_with("pr_auc"), starts_with("roc_auc")) |>
-  select(outcome, specification,
-         pr_auc_Logit, pr_auc_RF, pr_auc_SVM, pr_auc_MLP,
-         roc_auc_Logit, roc_auc_RF, roc_auc_SVM, roc_auc_MLP) |>
-  kbl(format = "latex", 
-      booktabs = TRUE, 
-      digits = 2, 
-      linesep = "",
-      align = "llcccccccc",
-      col.names = c("Outcome", "Specification", rep(c("Logit","RF","SVM","MLP"), 2)),
-      caption = "Out-of-sample performance by outcome, specification and model") |>
-  add_header_above(c(" " = 2, "PR-AUC" = 4, "ROC-AUC" = 4)) |>
-  collapse_rows(columns = 1, latex_hline = "major", valign = "top")
-
-datasummary_df(model_auc, output = "latex")
-
-
-
-
-
-# Evaluation with cluster Bootstrap ===========================================
-
-# Cluster bootstrap for AUC inference (resamples whole countries, not rows)
-
-cluster_bootstrap_auc <- function(results, outcome, cluster_var = "iso3c",
-                                  metric = c("roc_auc", "pr_auc"),
-                                  null_value = NULL,
-                                  n_boot = 1000, seed = 123) {
-  
-  metric <- match.arg(metric)
-  results <- results |> filter(!is.na(.data[[outcome]]), !is.na(.pred_1))
-  
-  auc_fn <- function(df) {
-    tryCatch({
-      if (metric == "roc_auc") {
-        as.numeric(pROC::auc(df[[outcome]], df$.pred_1, levels = c("0","1"), direction = "<"))
-      } else {
-        yardstick::pr_auc_vec(truth = df[[outcome]], estimate = df$.pred_1, event_level = "second")
-      }
-    }, error = function(e) NA_real_)
-  }
-  
-  observed <- auc_fn(results)
-  
-  # Default null: 0.5 for ROC-AUC, prevalence for PR-AUC
-  if (is.null(null_value)) {
-    null_value <- if (metric == "roc_auc") 0.5 else {
-      mean(as.numeric(as.character(results[[outcome]])), na.rm = TRUE)
+make_folds <- function(data, cv_periods) {
+  splits <- pmap(
+    cv_periods,
+    \(id, analysis_start, assessment_year, analysis_end) {
+      make_splits(
+        x = list(
+          analysis   = which(data$year >= analysis_start &
+                               data$year <= analysis_end),
+          assessment = which(data$year == assessment_year)
+        ),
+        data = data
+      )
     }
-  }
+  )
+  manual_rset(splits = splits, ids = cv_periods$id)
+}
+
+tune_once <- function(data, model, horizon, retune_year) {
+  message("  tuning ", model, ", retune year ", retune_year)
+  set.seed(222)
+  folds <- make_folds(data, make_cv_periods(horizon, retune_year))
+  wf    <- workflow_fns[[model]](data)
+  grid  <- grid_fns[[model]](data, grid_size[[model]])
   
-  set.seed(seed)
-  countries <- unique(results[[cluster_var]])
-  n_countries <- length(countries)
-  by_country <- split(results, results[[cluster_var]])
-  
-  boot_values <- map_dbl(seq_len(n_boot), function(i) {
-    sampled <- sample(countries, n_countries, replace = TRUE)
-    auc_fn(list_rbind(by_country[sampled]))
-  })
-  boot_values <- boot_values[!is.na(boot_values)]
-  
-  # One-sample bootstrap p-value: shift the distribution to be centered
-  # under the null, then see how extreme the observed value is relative to it
-  centered <- boot_values - mean(boot_values) + null_value
-  p_value <- mean(abs(centered - null_value) >= abs(observed - null_value))
+  res <- tune_grid(
+    wf, resamples = folds, grid = grid,
+    metrics = metric_set(roc_auc),
+    control = control_grid(save_pred = FALSE, verbose = FALSE)
+  )
+  best <- show_best(res, metric = "roc_auc", n = 1)
   
   tibble(
-    metric       = metric,
-    estimate     = observed,
-    std.error    = sd(boot_values),
-    null_value   = null_value,
-    ci_lower     = quantile(boot_values, 0.025, names = FALSE),
-    ci_upper     = quantile(boot_values, 0.975, names = FALSE),
-    p.value      = p_value,
-    n_valid_boot = length(boot_values)
+    retune_year = retune_year,
+    params      = list(select_best(res, metric = "roc_auc")),
+    cv_roc_auc  = best$mean,
+    cv_n_folds  = best$n
   )
 }
 
-
-# Gather all OOS predictions into one long structure, keyed by model/outcome/spec
-all_oos_results <- bind_rows(
-  logit_oos_results |> select(outcome, specification, preds) |> mutate(model = "Logit"),
-  map(outcomes, \(o) tibble(outcome = o, specification = names(rf_oos_results_all[[o]]),
-                            preds = rf_oos_results_all[[o]])) |> list_rbind() |> mutate(model = "RF"),
-  map(outcomes, \(o) tibble(outcome = o, specification = names(svm_oos_results_all[[o]]),
-                            preds = svm_oos_results_all[[o]])) |> list_rbind() |> mutate(model = "SVM"),
-  map(outcomes, \(o) tibble(outcome = o, specification = names(mlp_oos_results_all[[o]]),
-                            preds = mlp_oos_results_all[[o]])) |> list_rbind() |> mutate(model = "MLP")
-)
-
-set.seed(123)
-
-vs_random <- all_oos_results |>
-  mutate(
-    roc = map2(preds, outcome, \(p, o) cluster_bootstrap_auc(p, o, metric = "roc_auc", n_boot = 1000)),
-    pr  = map2(preds, outcome, \(p, o) cluster_bootstrap_auc(p, o, metric = "pr_auc",  n_boot = 1000))
-  ) |>
-  select(model, outcome, specification, roc, pr) |>
-  pivot_longer(c(roc, pr), names_to = "which", values_to = "result") |>
-  unnest(result) |>
-  select(model, outcome, specification, metric, estimate, std.error, p.value)
-
-
-build_modelsummary_vs_random <- function(vs_random, metric_choice) {
-  vs_random |>
-    filter(metric == metric_choice) |>
-    mutate(
-      group = outcome,                      # becomes the spanning row label
-      term  = str_to_title(specification)   # becomes the within-group row label
-    ) |>
-    select(model, group, term, estimate, std.error, p.value) |>
-    split(~model) |>
-    map(\(df) select(df, group, term, estimate, std.error, p.value)) |>
-    map(as_modelsummary_model)
+tune_model <- function(data, model, horizon, tune_years) {
+  map(tune_years, \(R) tune_once(data, model, horizon, R)) |> list_rbind()
 }
 
+## 9.2 Forecasting ============================================================
 
-# Wrap a tidy data.frame as a modelsummary-recognized "model"
-as_modelsummary_model <- function(tidy_df, n_obs = NA) {
-  mod <- list(
-    tidy   = tidy_df,
-    glance = data.frame(nobs = n_obs)
+# Expanding window, gap of `horizon` years, parameters of the most recent
+# retuning date.
+forecast_ml <- function(data, tuned, model, horizon, forecast_years) {
+  set.seed(222)
+  wf_template <- workflow_fns[[model]](data)
+  
+  map(forecast_years, \(y) {
+    message("Forecasting ", model, ", year ", y)
+    params <- tuned$params[[which(tuned$retune_year == retune_year_of(y))]]
+    train  <- filter(data, year >= first_year, year <= y - 1 - horizon)
+    test   <- filter(data, year == y)
+    if (nrow(test) == 0) return(NULL)
+    
+    fit <- finalize_workflow(wf_template, params) |> fit(data = train)
+    test |>
+      transmute(iso3c, year, truth,
+                .pred_1 = predict(fit, new_data = test, type = "prob")$.pred_1)
+  }) |> list_rbind()
+}
+
+forecast_logit <- function(data, spec_vars, horizon, forecast_years) {
+  formula <- reformulate(spec_vars, response = "truth")
+  
+  map(forecast_years, \(y) {
+    train <- filter(data, year >= first_year, year <= y - 1 - horizon)
+    test  <- filter(data, year == y)
+    if (nrow(test) == 0) return(NULL)
+    
+    fit <- glm(formula, data = train, family = binomial())
+    test |>
+      transmute(iso3c, year, truth,
+                .pred_1 = predict(fit, newdata = test, type = "response"))
+  }) |> list_rbind()
+}
+
+## 9.3 Cache keys =============================================================
+# The key changes when the data, configuration or model code changes.
+# Helper functions not listed in `code` (e.g. `get_panel`) are not tracked;
+# delete the cache folder if you change those.
+
+tune_key <- function(data, model, horizon, max_year) {
+  rlang::hash(list(
+    data  = data, model = model, horizon = horizon, max_year = max_year,
+    cfg   = list(retune_years, n_assess, first_year, grid_size[[model]]),
+    code  = map(list(workflow_fns[[model]], grid_fns[[model]], make_cv_periods,
+                     make_folds, tune_once, tune_model), deparse)
+  ))
+}
+
+## 9.4 Predictions for one scenario cell ======================================
+
+get_preds <- function(scn_name, model, outcome, spec) {
+  message(format(Sys.time(), "%H:%M:%S"), " | ", scn_name, " | ", model,
+          " | ", outcome, " | ", spec)
+  scn   <- scenarios[[scn_name]]
+  data  <- get_panel(scn, outcome, spec)
+  h     <- horizon_of(outcome)
+  years <- first_test_year:max_test_year(outcome)
+  
+  if (model == "Logit") {
+    return(forecast_logit(data, scn$specs[[spec]], h, years))
+  }
+  
+  tk <- tune_key(data, model, h, max(years))
+  tuned <- cached(
+    cache_file("tune", model, outcome, spec, tk),
+    tune_model(data, model, h, retune_years[retune_years <= max(years)])
   )
-  class(mod) <- "modelsummary_list"
-  mod
+  
+  fk <- rlang::hash(list(tk, years, deparse(forecast_ml)))
+  cached(
+    cache_file("oos", model, outcome, spec, fk),
+    forecast_ml(data, tuned, model, h, years)
+  )
 }
 
-
-models_roc_random <- build_modelsummary_vs_random(vs_random, "roc_auc")[c("Logit", "RF", "SVM", "MLP")]
-models_pr_random  <- build_modelsummary_vs_random(vs_random, "pr_auc")[c("Logit", "RF", "SVM", "MLP")]
-
-modelsummary(
-  models_roc_random,
-  title = "Out-of-sample ROC-AUC vs. random benchmark (AUC = 0.5)",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.",
-    "Stars denote significance of the cluster-bootstrap test against AUC = 0.5."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  models_pr_random,
-  title = "Out-of-sample PR-AUC vs. prevalence benchmark",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.",
-    "Null for PR-AUC is each outcome's prevalence, not a fixed constant across outcomes.",
-    "Stars denote significance of the cluster-bootstrap test against that prevalence."
-  ),
-  output = "latex"
-)
-
-
-
-
-# Robustness Checks ==========================================================
-
-## RC1: estimate baseline & broad on the SAME sample as the full specification ====
-
-specs_rc1 <- specs[c("baseline", "broad")]
-
-# Generic logit pipeline; `data` can be one shared data frame or a named
-# list of per-outcome data frames (needed when the sample differs by outcome)
-run_logit_pipeline <- function(data, specs_subset, outcomes) {
-  
-  get_data <- function(o) if (is.data.frame(data)) data else data[[o]]
-  
-  oos <- expand_grid(outcome = outcomes, specification = names(specs_subset)) |>
+# All models x outcomes x specifications of one scenario.
+# Long tibble: scenario, model, outcome, specification, preds (list-column)
+run_scenario <- function(scn_name, which_models = models) {
+  scn <- scenarios[[scn_name]]
+  expand_grid(model = which_models, outcome = outcomes,
+              specification = names(scn$specs)) |>
     mutate(
-      preds = map2(outcome, specification, \(o, s) {
-        forecast_logit(
-          formula        = reformulate(specs_subset[[s]], response = o),
-          data           = get_data(o),
-          forecast_years = 2005:max_test_year(o),
-          horizon        = horizon_of(o)
-        )
-      })
+      scenario = scn_name,
+      preds = pmap(list(model, outcome, specification),
+                   \(m, o, s) get_preds(scn_name, m, o, s)),
+      .before = 1
     )
-  
-  auc <- oos |>
-    mutate(metrics = map2(preds, outcome, evaluate)) |>
-    select(outcome, specification, metrics) |>
-    unnest(metrics)
-  
-  list(oos = oos, auc = auc)
 }
 
-# Logit: restrict panel_logit to rows non-missing on full-spec vars
-panel_logit_rc1 <- map(outcomes, \(o) {
-  panel_logit |>
-    select(year, iso3c, all_of(o), all_of(specs$full)) |>
-    drop_na()
-}) |> setNames(outcomes)
+# 10 Run scenarios ============================================================
+# Tip: for quick iterations run only run_scenario("main") or a single model,
+# e.g. run_scenario("main", which_models = c("Logit", "RF")).
 
-logit_rc1 <- run_logit_pipeline(panel_logit_rc1, specs_rc1, outcomes)
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
 
-# ML: reuse the already-cleaned full-spec panels, just select fewer cols
-panels_ml_rc1 <- map(outcomes, \(o) {
-  full_data <- panels_ml_all[[o]][["full"]]
-  map(specs_rc1, \(vars) full_data |> select(year, iso3c, all_of(o), all_of(vars)))
-}) |> setNames(outcomes)
-
-train_rc1 <- map(panels_ml_rc1, \(spec_list) map(spec_list, \(d) filter(d, year <= 2004)))
-
-# Shared CV-fold builder (reuses make_cv_periods / make_folds you already have)
-make_folds_for <- function(train_list, outcomes) {
-  map(outcomes, \(o) {
-    cvp <- make_cv_periods(horizon_of(o))
-    map(train_list[[o]], \(d) make_folds(d, cvp))
-  }) |> setNames(outcomes)
-}
-
-folds_rc1 <- make_folds_for(train_rc1, outcomes)
-
-
-# Generic ML pipeline: tune -> select best -> forecast -> evaluate, per outcome
-run_ml_pipeline <- function(panels_ml, train, folds, outcomes, model_type, grid_size = 30) {
-  
-  set.seed(123)
-  tuned <- map(outcomes, \(o) {
-    map2(train[[o]], folds[[o]],
-         \(d, f) tune_model(d, f, outcome = o, model_type = model_type, grid_size = grid_size))
-  }) |> setNames(outcomes)
-  
-  best <- map(tuned, \(spec_list) map(spec_list, \(x) select_best(x, metric = "pr_auc")))
-  
-  set.seed(123)
-  oos <- map(outcomes, \(o) {
-    map2(panels_ml[[o]], best[[o]], \(data, params) forecast_model(
-      data, params,
-      forecast_years = 2005:max_test_year(o),
-      horizon = horizon_of(o), outcome = o, model_type = model_type
-    ))
-  }) |> setNames(outcomes)
-  
-  auc <- map(outcomes, \(o) {
-    map(oos[[o]], \(res) evaluate(res, o)) |> list_rbind(names_to = "specification")
-  }) |> setNames(outcomes) |> list_rbind(names_to = "outcome")
-  
-  list(tuned = tuned, best = best, oos = oos, auc = auc)
-}
-
-rf_rc1  <- run_ml_pipeline(panels_ml_rc1, train_rc1, folds_rc1, outcomes, "rf")
-svm_rc1 <- run_ml_pipeline(panels_ml_rc1, train_rc1, folds_rc1, outcomes, "svm")
-mlp_rc1 <- run_ml_pipeline(panels_ml_rc1, train_rc1, folds_rc1, outcomes, "mlp", grid_size = 15)
-
-rc1_auc <- bind_rows(
-  logit_rc1$auc |> mutate(model = "Logit"),
-  rf_rc1$auc    |> mutate(model = "RF"),
-  svm_rc1$auc   |> mutate(model = "SVM"),
-  mlp_rc1$auc   |> mutate(model = "MLP")
-) |> mutate(check = "RC1: reduced sample")
-
-rc1_auc |>
-  select(outcome, specification, .metric, .estimate, model) |> 
-  pivot_wider(names_from = model, values_from = .estimate) |> 
-  arrange(.metric)
-
-## RC2: cgdppriv_growth -> tlpriv_rgrowth, bmgdpgrowth -> bm_rgrowth =========
-
-full_vars_rc2 <- c("advanced", "tlpriv_rgrowth", "govcgdp_growth",
-                   "rgdpgrowth", "inflation", "ltd", "bcagdp",
-                   "bm_rgrowth", "bmtr", "sprr")
-
-specs_rc2 <- list(full = full_vars_rc2)
-
-# Logit: panel_logit already has advanced as factor; vars just swapped
-logit_rc2 <- run_logit_pipeline(panel_logit, specs_rc2, outcomes)
-
-# ML
-panels_ml_rc2 <- map(outcomes, \(o) {
-  map(specs_rc2, \(vars) panel_temp |>
-        select(year, iso3c, all_of(o), all_of(vars)) |>
-        drop_na())
-}) |> setNames(outcomes)
-
-train_rc2 <- map(panels_ml_rc2, \(spec_list) map(spec_list, \(d) filter(d, year <= 2004)))
-folds_rc2 <- make_folds_for(train_rc2, outcomes)
-
-rf_rc2  <- run_ml_pipeline(panels_ml_rc2, train_rc2, folds_rc2, outcomes, "rf")
-svm_rc2 <- run_ml_pipeline(panels_ml_rc2, train_rc2, folds_rc2, outcomes, "svm")
-mlp_rc2 <- run_ml_pipeline(panels_ml_rc2, train_rc2, folds_rc2, outcomes, "mlp", grid_size = 15)
-
-rc2_auc <- bind_rows(
-  logit_rc2$auc |> mutate(model = "Logit"),
-  rf_rc2$auc    |> mutate(model = "RF"),
-  svm_rc2$auc   |> mutate(model = "SVM"),
-  mlp_rc2$auc   |> mutate(model = "MLP")
-) |> mutate(check = "RC2: real growth vars")
-
-rc2_auc |> 
-  select(outcome, specification, .metric, .estimate, model) |> 
-  pivot_wider(names_from = model, values_from = .estimate) |> 
-  arrange(.metric)
-
-## RC3: advanced -> region =====================================================
-
-full_vars_rc3 <- c("region", "cgdppriv_growth", "govcgdp_growth",
-                   "rgdpgrowth", "inflation", "ltd", "bcagdp",
-                   "bmgdpgrowth", "bmtr", "sprr")
-
-specs_rc3 <- list(full = full_vars_rc3)
-
-# Logit: need a region-aware version of panel_logit; glm dummy-codes
-# factors automatically via the model formula, so no step_dummy needed
-panel_logit_rc3 <- panel |>
-  filter(crisis != 1) |>
-  mutate(
-    region = factor(region),
-    across(all_of(outcomes), factor)
-  )
-
-logit_rc3 <- run_logit_pipeline(panel_logit_rc3, specs_rc3, outcomes)
-
-# ML: region as factor; step_dummy() in the updated SVM/MLP workflows
-# handles the encoding, ranger (RF) uses the raw factor natively
-panel_temp_rc3 <- panel |>
-  filter(crisis != 1) |>
-  mutate(across(all_of(outcomes), factor), region = factor(region))
-
-panels_ml_rc3 <- map(outcomes, \(o) {
-  map(specs_rc3, \(vars) panel_temp_rc3 |>
-        select(year, iso3c, all_of(o), all_of(vars)) |>
-        drop_na())
-}) |> setNames(outcomes)
-
-train_rc3 <- map(panels_ml_rc3, \(spec_list) map(spec_list, \(d) filter(d, year <= 2004)))
-folds_rc3 <- make_folds_for(train_rc3, outcomes)
-
-rf_rc3  <- run_ml_pipeline(panels_ml_rc3, train_rc3, folds_rc3, outcomes, "rf")
-svm_rc3 <- run_ml_pipeline(panels_ml_rc3, train_rc3, folds_rc3, outcomes, "svm")
-mlp_rc3 <- run_ml_pipeline(panels_ml_rc3, train_rc3, folds_rc3, outcomes, "mlp", grid_size = 15)
-
-rc3_auc <- bind_rows(
-  logit_rc3$auc |> mutate(model = "Logit"),
-  rf_rc3$auc    |> mutate(model = "RF"),
-  svm_rc3$auc   |> mutate(model = "SVM"),
-  mlp_rc3$auc   |> mutate(model = "MLP")
-) |> mutate(check = "RC3: region")
-
-rc3_auc |> 
-  select(outcome, specification, .metric, .estimate, model) |> 
-  pivot_wider(names_from = model, values_from = .estimate) |> 
-  arrange(.metric)
-
-## No years after COVID =======================================================
-
-# Modify the "evaluate" function such that it only considers predictions up to 2019
-rob2_evaluate <- function(results, outcome) {
-  results <- results |> filter(!is.na(.data[[outcome]]), !is.na(.pred_1), year <= 2019)
-  bind_rows(
-    roc_auc(results, truth = !!sym(outcome), .pred_1, event_level = "second"),
-    pr_auc( results, truth = !!sym(outcome), .pred_1, event_level = "second")
-  )
-}
-
-# Logit
-rob2_logit_auc <- logit_oos_results |>
-  mutate(metrics = map2(preds, outcome, rob2_evaluate)) |>
-  select(outcome, specification, metrics) |>
-  unnest(metrics)
-
-# RF
-rob2_rf_auc <- map(outcomes, \(o) {
-  map(rf_oos_results_all[[o]], \(res) rob2_evaluate(res, o)) |>
-    list_rbind(names_to = "specification")
-}) |>
-  setNames(outcomes) |>
-  list_rbind(names_to = "outcome")
-
-# SVM
-rob2_svm_auc <- map(outcomes, \(o) {
-  map(svm_oos_results_all[[o]], \(res) rob2_evaluate(res, o)) |>
-    list_rbind(names_to = "specification")
-}) |>
-  setNames(outcomes) |>
-  list_rbind(names_to = "outcome")
-
-# MLP
-rob2_mlp_auc <- map(outcomes, \(o) {
-  map(mlp_oos_results_all[[o]], \(res) rob2_evaluate(res, o)) |>
-    list_rbind(names_to = "specification")
-}) |>
-  setNames(outcomes) |>
-  list_rbind(names_to = "outcome")
-
-# Evaluate
-rob2_model_auc <- bind_rows(
-  
-  rob2_logit_auc |> 
-    mutate(model = "Logit"),
-  
-  rob2_rf_auc |>
-    mutate(model = "Random Forest"),
-  
-  rob2_svm_auc |>
-    mutate(model = "SVM"),
-  
-  rob2_mlp_auc |>
-    mutate(model = "MLP")
-  
-) |>
-  select(
-    outcome,
-    specification,
-    model,
-    .metric,
-    .estimate
-  ) |> 
-  pivot_wider(
-    names_from = "outcome",
-    values_from = ".estimate"
-  ) |> 
-  arrange(.metric)
-
-
-datasummary_df(rob2_model_auc)
-
-
-
-# Robchecks with bootstrap ==================================================
-
-# Normalize either pipeline's OOS output into one long tibble:
-# columns = model, outcome, specification, preds
-normalize_oos <- function(pipeline_result, model_name, is_logit = FALSE) {
-  
-  if (is_logit) {
-    pipeline_result$oos |>
-      select(outcome, specification, preds) |>
-      mutate(model = model_name)
-  } else {
-    map(names(pipeline_result$oos), \(o) {
-      spec_list <- pipeline_result$oos[[o]]
-      tibble(
-        outcome       = o,
-        specification = names(spec_list),
-        preds         = spec_list
-      )
-    }) |>
-      list_rbind() |>
-      mutate(model = model_name)
-  }
-}
-
-
-# Build the vs-random bootstrap table for one robustness check,
-# given its logit + rf + svm + mlp pipeline results.
-# year_filter: optional max year to restrict predictions to (for RC4)
-build_vs_random_check <- function(logit_result, rf_result, svm_result, mlp_result,
-                                  check_label, year_filter = NULL, n_boot = 1000) {
-  
-  all_results <- bind_rows(
-    normalize_oos(logit_result, "Logit", is_logit = TRUE),
-    normalize_oos(rf_result,  "RF"),
-    normalize_oos(svm_result, "SVM"),
-    normalize_oos(mlp_result, "MLP")
-  )
-  
-  if (!is.null(year_filter)) {
-    all_results <- all_results |>
-      mutate(preds = map(preds, \(df) filter(df, year <= year_filter)))
-  }
-  
-  set.seed(123)
-  
-  all_results |>
-    mutate(
-      roc = map2(preds, outcome, \(p, o) cluster_bootstrap_auc(p, o, metric = "roc_auc", n_boot = n_boot)),
-      pr  = map2(preds, outcome, \(p, o) cluster_bootstrap_auc(p, o, metric = "pr_auc",  n_boot = n_boot))
-    ) |>
-    select(model, outcome, specification, roc, pr) |>
-    pivot_longer(c(roc, pr), names_to = "which", values_to = "result") |>
-    unnest(result) |>
-    select(model, outcome, specification, metric, estimate, std.error, p.value) |>
-    mutate(check = check_label)
-}
-
-vs_random_rc1 <- build_vs_random_check(logit_rc1, rf_rc1, svm_rc1, mlp_rc1, "RC1: reduced sample")
-vs_random_rc2 <- build_vs_random_check(logit_rc2, rf_rc2, svm_rc2, mlp_rc2, "RC2: real growth vars")
-vs_random_rc3 <- build_vs_random_check(logit_rc3, rf_rc3, svm_rc3, mlp_rc3, "RC3: region")
-
-# Build "pipeline-shaped" wrappers around your main-analysis results so
-# normalize_oos() can consume them the same way as RC1-3
-main_logit_as_pipeline <- list(oos = logit_oos_results)
-main_rf_as_pipeline    <- list(oos = rf_oos_results_all)
-main_svm_as_pipeline   <- list(oos = svm_oos_results_all)
-main_mlp_as_pipeline   <- list(oos = mlp_oos_results_all)
-
-vs_random_rc4 <- build_vs_random_check(
-  main_logit_as_pipeline, main_rf_as_pipeline, main_svm_as_pipeline, main_mlp_as_pipeline,
-  check_label = "RC4: excluding COVID years",
-  year_filter = 2019
-)
-
-vs_random_all_rc <- bind_rows(vs_random_rc1, vs_random_rc2, vs_random_rc3, vs_random_rc4)
-
-build_modelsummary_rc <- function(vs_random_all_rc, check_label, metric_choice) {
-  vs_random_all_rc |>
-    filter(check == check_label, metric == metric_choice) |>
-    mutate(group = outcome, term = str_to_title(specification)) |>
-    select(model, group, term, estimate, std.error, p.value) |>
-    split(~model) |>
-    map(\(df) select(df, group, term, estimate, std.error, p.value)) |>
-    map(as_modelsummary_model)
-}
-
-
-
-rc_labels <- c("RC1: reduced sample", "RC2: real growth vars", "RC3: region", "RC4: excluding COVID years")
-
-rc_tables_roc <- map(rc_labels, \(lbl) {
-  build_modelsummary_rc(vs_random_all_rc, lbl, "roc_auc")[c("Logit","RF","SVM","MLP")]
-}) |> setNames(rc_labels)
-
-rc_tables_pr <- map(rc_labels, \(lbl) {
-  build_modelsummary_rc(vs_random_all_rc, lbl, "pr_auc")[c("Logit","RF","SVM","MLP")]
-}) |> setNames(rc_labels)
-
-modelsummary(
-  rc_tables_roc[["RC1: reduced sample"]],
-  title = "RC1 (reduced sample): ROC-AUC vs. random benchmark (AUC = 0.5)",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses. 
-    Stars denote significance of the cluster-bootstrap test against AUC = 0.5."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  rc_tables_pr[["RC1: reduced sample"]],
-  title = "RC1 (reduced sample): PR-AUC vs. prevalence benchmark",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.
-    Null for PR-AUC is each outcome's prevalence, not a fixed constant across outcomes.
-    Stars denote significance of the cluster-bootstrap test against that prevalence."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  rc_tables_roc[["RC2: real growth vars"]],
-  title = "RC2 (real growth variables): ROC-AUC vs. random benchmark (AUC = 0.5)",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.
-    Stars denote significance of the cluster-bootstrap test against AUC = 0.5."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  rc_tables_pr[["RC2: real growth vars"]],
-  title = "RC2 (real growth variables): PR-AUC vs. prevalence benchmark",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.
-    Null for PR-AUC is each outcome's prevalence, not a fixed constant across outcomes.
-    Stars denote significance of the cluster-bootstrap test against that prevalence."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  rc_tables_roc[["RC3: region"]],
-  title = "RC3 (region): ROC-AUC vs. random benchmark (AUC = 0.5)",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.
-    Stars denote significance of the cluster-bootstrap test against AUC = 0.5."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  rc_tables_pr[["RC3: region"]],
-  title = "RC3 (region): PR-AUC vs. prevalence benchmark",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.
-    Null for PR-AUC is each outcome's prevalence, not a fixed constant across outcomes.
-    Stars denote significance of the cluster-bootstrap test against that prevalence."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  rc_tables_roc[["RC4: excluding COVID years"]],
-  title = "RC4 (excluding COVID years): ROC-AUC vs. random benchmark (AUC = 0.5)",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.
-    Stars denote significance of the cluster-bootstrap test against AUC = 0.5."
-  ),
-  output = "latex"
-)
-
-modelsummary(
-  rc_tables_pr[["RC4: excluding COVID years"]],
-  title = "RC4 (excluding COVID years): PR-AUC vs. prevalence benchmark",
-  shape = group + term ~ model,
-  stars = TRUE,
-  gof_omit = ".*",
-  notes = list(
-    "Standard errors (cluster bootstrap over countries, 1000 replicates) in parentheses.
-    Null for PR-AUC is each outcome's prevalence, not a fixed constant across outcomes.
-    Stars denote significance of the cluster-bootstrap test against that prevalence."
-  ),
-  output = "latex"
-)
+oos_all <- map(names(scenarios), run_scenario) |> list_rbind()
 
 stopCluster(cl)
+registerDoSEQ()
 
-# Mülleimer ================================================================
+# 11 Evaluation ===============================================================
 
-# forecast_rf_treeshap <- function(data, best_params, forecast_years) {
-#   
-#   final_workflow <- make_rf_workflow(data) |>
-#     finalize_workflow(best_params)
-#   
-#   map(
-#     forecast_years,
-#     function(y) {
-#       
-#       message("Processing year: ", y)
-#       
-#       # Expanding training sample
-#       train_data <- data |>
-#         filter(year >= 1970, year <= y - 1)
-#       
-#       # OOS test sample
-#       test_data <- data |>
-#         filter(year == y)
-#       
-#       # Fit RF
-#       fit <- final_workflow |>
-#         fit(data = train_data)
-#       
-#       # Extract ranger model
-#       rf_model <- extract_fit_engine(fit)
-#       
-#       # Predictors used by the RF
-#       X_train <- train_data |>
-#         select(-iso3c, -year, -precrisis3)
-#       
-#       X_test <- test_data |>
-#         select(-iso3c, -year, -precrisis3)
-#       
-#       # Convert ranger model to treeshap format
-#       unified_rf <- ranger.unify(
-#         rf_model,
-#         X_train
-#       )
-#       
-#       # Calculate TreeSHAP values
-#       shap <- treeshap(
-#         unified_rf,
-#         X_test
-#       )
-#       
-#       list(
-#         year = y,
-#         shap = shap,
-#         data = test_data
-#       )
-#     }
-#   )
-# }
-# 
-# rf_full_shap <- forecast_rf_treeshap(
-#   data = panels_ml$full,
-#   best_params = best_rf$full,
-#   forecast_years = 2005:2022
-# )
-# 
-# shap_full <- map(
-#   rf_full_shap,
-#   function(x) {
-#     
-#     x$shap$shaps |>
-#       as.data.frame() |>
-#       mutate(
-#         iso3c = x$data$iso3c,
-#         year = x$data$year,
-#         precrisis3 = x$data$precrisis3
-#       )
-#   }
-# ) |> 
-#   list_rbind()
-# 
-# shap_importance <- shap_full |>
-#   select(-c(iso3c, year, precrisis3)) |>
-#   summarise(
-#     across(
-#       everything(),
-#       ~ mean(abs(.x), na.rm = TRUE)
-#     )
-#   ) |>
-#   pivot_longer(
-#     everything(),
-#     names_to = "variable",
-#     values_to = "mean_abs_shap"
-#   ) |>
-#   arrange(desc(mean_abs_shap))
-# 
-# ggplot(
-#   shap_importance,
-#   aes(
-#     x = reorder(variable, mean_abs_shap),
-#     y = mean_abs_shap
-#   )
-# ) +
-#   geom_col() +
-#   coord_flip() +
-#   labs(
-#     x = NULL,
-#     y = "Mean absolute SHAP value"
-#   )
+restrict_years <- function(oos, max_year) {
+  oos |> mutate(preds = map(preds, \(d) filter(d, !is.na(.pred_1),
+                                               year <= max_year)))
+}
+
+
+
+## 11.2 DeLong test: Logit vs. each ML model ==================================
+# Paired DeLong test on the pooled out-of-sample predictions. Both models are
+# scored on exactly the same rows (joined on iso3c and year).
+# NOTE: DeLong assumes independent observations, which the panel violates
+# (overlapping pre-crisis windows, common crisis waves). Treat p-values as
+# optimistic.
+
+delong_one <- function(p_logit, p_ml) {
+  tryCatch({
+    d <- inner_join(
+      select(p_logit, iso3c, year, truth, p_logit = .pred_1),
+      select(p_ml, iso3c, year, truth_ml = truth, p_ml = .pred_1),
+      by = c("iso3c", "year")
+    ) |> filter(!is.na(p_logit), !is.na(p_ml))
+    stopifnot(all(d$truth == d$truth_ml))
+    
+    roc_l <- pROC::roc(d$truth, d$p_logit, levels = c("0", "1"),
+                       direction = "<", quiet = TRUE)
+    roc_m <- pROC::roc(d$truth, d$p_ml, levels = c("0", "1"),
+                       direction = "<", quiet = TRUE)
+    test  <- pROC::roc.test(roc_l, roc_m, method = "delong", paired = TRUE,
+                            alternative = "two.sided")
+    
+    auc_l <- as.numeric(pROC::auc(roc_l))
+    auc_m <- as.numeric(pROC::auc(roc_m))
+    diff  <- auc_m - auc_l
+    z     <- unname(test$statistic)
+    se    <- if (is.finite(z) && z != 0) abs(diff / z) else NA_real_
+    
+    tibble(n_matched = nrow(d), auc_logit = auc_l, auc_ml = auc_m,
+           diff = diff, se = se,
+           ci_lower = diff - 1.96 * se, ci_upper = diff + 1.96 * se,
+           z = z, p_value = test$p.value)
+  }, error = function(e) {
+    tibble(n_matched = NA_integer_, auc_logit = NA_real_, auc_ml = NA_real_,
+           diff = NA_real_, se = NA_real_, ci_lower = NA_real_,
+           ci_upper = NA_real_, z = NA_real_, p_value = NA_real_)
+  })
+}
+
+# Holm adjustment within each scenario x horizon x specification
+# (3 comparisons: Logit vs. RF, SVM, MLP). Change `group_by` to widen or
+# narrow the family of tests.
+delong_table <- function(oos, max_year = Inf) {
+  oos <- restrict_years(oos, max_year)
+  logit <- oos |>
+    filter(model == "Logit") |>
+    select(scenario, outcome, specification, p_logit = preds)
+  
+  oos |>
+    filter(model != "Logit") |>
+    inner_join(logit, by = c("scenario", "outcome", "specification")) |>
+    mutate(res = map2(p_logit, preds, delong_one)) |>
+    select(-preds, -p_logit) |>
+    unnest(res) |>
+    group_by(scenario, outcome, specification) |>
+    mutate(p_holm = p.adjust(p_value, method = "holm")) |>
+    ungroup()
+}
+
+## 11.3 ROC-AUC with standard DeLong confidence intervals =====================
+
+delong_roc_ci <- function(preds, level = 0.95) {
+  preds <- filter(preds, !is.na(.pred_1))
+  roc_obj <- pROC::roc(preds$truth, preds$.pred_1,
+                       levels = c("0", "1"), direction = "<", quiet = TRUE)
+  ci <- pROC::ci.auc(roc_obj, conf.level = level, method = "delong")
+  tibble(auc = as.numeric(pROC::auc(roc_obj)),
+         ci_lower = as.numeric(ci[1]), ci_upper = as.numeric(ci[3]))
+}
+
+roc_ci_table <- function(oos, max_year = Inf) {
+  restrict_years(oos, max_year) |>
+    mutate(result = map(preds, delong_roc_ci)) |>
+    select(-preds) |>
+    unnest(result)
+}
+
+
+## 11.4 PR-AUC with country-cluster bootstrap intervals =======================
+
+boot_pr_auc <- function(preds, n_boot = 1000, seed = 123, level = 0.95) {
+  preds <- filter(preds, !is.na(.pred_1))
+  stat <- function(d) {
+    if (n_distinct(d$truth) < 2) return(NA_real_)
+    suppressWarnings(tryCatch(
+      pr_auc_vec(d$truth, d$.pred_1, event_level = "second"),
+      error = \(e) NA_real_))
+  }
+  est <- stat(preds)
+  by_cntry <- unname(split(preds, preds$iso3c))
+  n_cntry <- length(by_cntry)
+  set.seed(seed)
+  boots <- map_dbl(seq_len(n_boot), \(i) {
+    stat(list_rbind(by_cntry[sample.int(n_cntry, n_cntry, replace = TRUE)]))
+  })
+  boots <- boots[is.finite(boots)]
+  if (length(boots) < 2) stop("Insufficient valid bootstrap replicates")
+  tibble(auc = est, se = sd(boots),
+         ci_lower = unname(quantile(boots, (1 - level) / 2)),
+         ci_upper = unname(quantile(boots, 1 - (1 - level) / 2)),
+         n_valid = length(boots), prevalence = mean(preds$truth == "1"))
+}
+
+pr_boot_table <- function(oos, max_year = Inf) {
+  restrict_years(oos, max_year) |>
+    mutate(n_pos = map_int(preds, \(p) sum(p$truth == "1", na.rm = TRUE)),
+           n_pos_countries = map_int(preds, \(p) n_distinct(p$iso3c[p$truth == "1"])),
+           boot = map(preds, \(p) {
+             key <- rlang::hash(list(p, n_boot, deparse(boot_pr_auc)))
+             cached(file.path(cache_dir, paste0("prboot_", substr(key, 1, 10), ".rds")),
+                    boot_pr_auc(p, n_boot = n_boot))
+           })) |>
+    select(-preds) |>
+    unnest(boot)
+}
+
+# 12 Tables ===================================================================
+
+latex_auc_ci_table <- function(ab, metric, caption, label) {
+
+  wide <- ab |>
+    mutate(
+      horizon = k_label(outcome),
+      spec = str_to_title(specification),
+      cell = sprintf("%.3f [%.3f, %.3f]",
+                     auc, ci_lower, ci_upper)
+    ) |>
+    select(horizon, spec, model, cell,
+           any_of(c("prevalence", "n_pos", "n_pos_countries"))) |>
+    pivot_wider(names_from = model, values_from = cell)
+
+  if (metric == "PR") {
+    wide <- wide |>
+      select(horizon, spec, all_of(models),
+             prevalence, n_pos, n_pos_countries)
+  } else {
+    wide <- wide |>
+      select(horizon, spec, all_of(models))
+  }
+
+  if (metric == "PR") {
+    col_names <- c("Horizon", "Specification", models,
+                   "Prevalence", "Pre-crisis obs.", "Countries")
+    alignment <- "llccccrrr"
+  } else {
+    col_names <- c("Horizon", "Specification", models)
+    alignment <- "llcccc"
+  }
+
+  wide |>
+    kbl(
+      format = "latex",
+      booktabs = TRUE,
+      digits = 3,
+      linesep = "",
+      align = alignment,
+      col.names = col_names,
+      caption = caption,
+      label = label
+    ) |>
+    collapse_rows(
+      columns = 1,
+      latex_hline = "major",
+      valign = "top"
+    )
+}
+
+
+latex_delong_table <- function(dl, caption, label) {
+  dl |>
+    mutate(
+      horizon = k_label(outcome),
+      spec    = str_to_title(specification),
+      model   = factor(model, levels = ml_models),
+      diff_s  = sprintf("%.3f%s", diff, stars(p_holm)),
+      ci      = sprintf("[%.3f, %.3f]", ci_lower, ci_upper),
+      p_holm_s = sprintf("%.3f", p_holm)
+    ) |>
+    arrange(outcome, specification, model) |>
+    select(horizon, spec, model, auc_logit, auc_ml, diff_s, ci, p_holm_s) |>
+    kbl(format = "latex", booktabs = TRUE, digits = 3, linesep = "",
+        align = "lllrrrrr",
+        col.names = c("Horizon", "Specification", "Model", "AUC Logit",
+                      "AUC ML", "Difference", "95\\% CI", "p (Holm)"),
+        escape = FALSE, caption = caption, label = label) |>
+    collapse_rows(columns = 1:2, latex_hline = "major", valign = "top") |>
+    footnote(
+      general = paste(
+        "Difference = AUC(ML) - AUC(Logit). Paired DeLong test, two-sided,",
+        "on pooled out-of-sample predictions; the CI is the difference",
+        "$\\pm$ 1.96 DeLong standard errors. Holm adjustment within each",
+        "horizon and specification (three comparisons). Stars refer to the",
+        "Holm-adjusted p-value: * p<0.1, ** p<0.05, *** p<0.01."
+      ),
+      general_title = "Notes: ", threeparttable = TRUE, escape = FALSE
+    )
+}
+
+# Main results: standard DeLong ROC intervals; cluster-bootstrap PR intervals.
+main_oos <- filter(oos_all, scenario == "main")
+roc_ci_main  <- roc_ci_table(main_oos)
+pr_boot_main <- pr_boot_table(main_oos)
+
+write_table(latex_auc_ci_table(roc_ci_main, "ROC",
+                               "Out-of-sample ROC-AUC with standard DeLong confidence intervals", "roc_ci_main"),
+            "roc_ci_main")
+write_table(latex_auc_ci_table(pr_boot_main, "PR",
+                               "Out-of-sample PR-AUC with country-cluster bootstrap intervals", "pr_boot_main"),
+            "pr_boot_main")
+
+# 13 Robustness checks ========================================================
+# All checks go through the same functions. RC4 re-evaluates main predictions.
+
+checks <- tribble(
+  ~check,                        ~scn,   ~max_year,
+  "Main",                        "main", Inf,
+  "RC1: reduced sample",         "rc1",  Inf,
+  "RC2: real growth vars",       "rc2",  Inf,
+  "RC3: region",                 "rc3",  Inf,
+  "RC4: excluding COVID years",  "main", 2019
+)
+
+delong_checks <- pmap(checks, \(check, scn, max_year) {
+  delong_table(filter(oos_all, scenario == scn), max_year) |>
+    mutate(check = check)
+}) |> list_rbind()
+
+walk(which(checks$check != "Main"), \(i) {
+  ck <- checks$check[i]
+  scn <- checks$scn[i]
+  max_year <- checks$max_year[i]
+  tag <- tolower(sub(":.*", "", ck))
+  oos <- filter(oos_all, scenario == scn)
+  roc_ci <- roc_ci_table(oos, max_year)
+  write_table(latex_auc_ci_table(roc_ci, "ROC",
+                                 paste0("Out-of-sample ROC-AUC (", ck, ")"),
+                                 paste0("roc_ci_", tag)), paste0("roc_ci_", tag))
+  pr_boot <- pr_boot_table(oos, max_year)
+  write_table(latex_auc_ci_table(pr_boot, "PR",
+                                 paste0("Out-of-sample PR-AUC (", ck, ")"),
+                                 paste0("pr_boot_", tag)), paste0("pr_boot_", tag))
+  write_table(
+    latex_delong_table(filter(delong_checks, check == ck),
+                       paste0("Logit vs. machine learning, DeLong test (", ck, ")"),
+                       paste0("delong_", tag)),
+    paste0("delong_", tag)
+  )
+})
+
+# 14 ROC and PR curves ========================================================
+# Pooled out-of-sample predictions, one panel per horizon.
+
+model_colours <- c(Logit = "black", RF = "#1b9e77", SVM = "#d95f02",
+                   MLP = "#7570b3")
+
+plot_roc_pr <- function(oos, scn_name = "main", spec_name = "full",
+                        max_year = Inf) {
+  d <- oos |>
+    filter(scenario == scn_name, specification == spec_name) |>
+    restrict_years(max_year) |>
+    mutate(horizon = k_label(outcome),
+           model   = factor(model, levels = models))
+  
+  roc_df <- d |>
+    mutate(curve = map(preds, \(p) roc_curve(p, truth, .pred_1,
+                                             event_level = "second"))) |>
+    select(model, horizon, curve) |>
+    unnest(curve) |>
+    mutate(fpr = 1 - specificity)
+  
+  pr_df <- d |>
+    mutate(curve = map(preds, \(p) pr_curve(p, truth, .pred_1,
+                                            event_level = "second"))) |>
+    select(model, horizon, curve) |>
+    unnest(curve) |>
+    filter(is.finite(precision))
+  
+  prev <- d |>
+    mutate(prev = map_dbl(preds, \(p) mean(p$truth == "1"))) |>
+    group_by(horizon) |>
+    summarise(prev = first(prev), .groups = "drop")
+  
+  p_roc <- ggplot(roc_df, aes(fpr, sensitivity, colour = model, linetype = model)) +
+    geom_abline(slope = 1, intercept = 0, colour = "grey50", linewidth = 0.4) +
+    geom_path(linewidth = 0.6) +
+    facet_wrap(~horizon, nrow = 1) +
+    scale_colour_manual(values = model_colours) +
+    coord_equal() +
+    labs(x = "False positive rate", y = "True positive rate",
+         colour = NULL, linetype = NULL)
+  
+  p_pr <- ggplot(pr_df, aes(recall, precision, colour = model, linetype = model)) +
+    geom_hline(data = prev, aes(yintercept = prev),
+               colour = "grey50", linewidth = 0.4) +
+    geom_path(linewidth = 0.6) +
+    facet_wrap(~horizon, nrow = 1) +
+    scale_colour_manual(values = model_colours) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(x = "Recall", y = "Precision", colour = NULL, linetype = NULL)
+  
+  (p_roc / p_pr) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+}
+
+# Main scenario, one figure per specification
+walk(names(specs), \(s) {
+  ggsave(file.path(fig_dir, paste0("roc_pr_main_", s, ".png")),
+         plot_roc_pr(oos_all, "main", s), width = 11, height = 7)
+})
+
+# Robustness check 1
+walk(c("baseline", "broad"), \(s) {
+  ggsave(file.path(fig_dir, paste0("roc_pr_rc1_", s, ".png")),
+         plot_roc_pr(oos_all, "rc1", s), width = 11, height = 7)
+})
+
+# Robustness checks 2 and 3
+walk(c("rc2", "rc3"), \(r) {
+  ggsave(file.path(fig_dir, paste0("roc_pr_", r, "_full.png")),
+         plot_roc_pr(oos_all, r, "full"), width = 11, height = 7)
+})
+
+# Robustness check 4 (no COVID years)
+walk(names(specs), \(s) {
+  ggsave(file.path(fig_dir, paste0("roc_pr_rc4_", s, ".png")),
+         plot_roc_pr(oos_all, "main", s, max_year = 2019), width = 11, height = 7)
+})
